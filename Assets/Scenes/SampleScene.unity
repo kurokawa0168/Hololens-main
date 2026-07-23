@@ -195,6 +195,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   arPanelPrefab: {fileID: 6499093154115924199, guid: 71cf1e7b4441b5843a39c3641cf56fd6, type: 3}
+  webcamCanvas: {fileID: 1349164697}
   scanInterval: 0.1
 --- !u!1 &381219529
 GameObject:

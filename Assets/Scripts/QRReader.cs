@@ -12,8 +12,12 @@ public class QRReader : MonoBehaviour
     private Transform mainCameraTransform;
 
     [Header("UI Prefab Settings")]
-    [Tooltip("請把剛剛做好的 AR_Panel Prefab 拖到這裡")]
+    [Tooltip("請把做好的 AR_Panel Prefab 拖到這裡")]
     public GameObject arPanelPrefab;   
+
+    [Header("Environment Settings")]
+    [Tooltip("電腦測試用的 Webcam 背景 Canvas（HoloLens 上會自動關閉）")]
+    public GameObject webcamCanvas; 
 
     [Header("Detection Settings")]
     [Range(0.05f, 2f)]
@@ -26,8 +30,8 @@ public class QRReader : MonoBehaviour
         public GameObject panelInstance;
         public TMP_Text titleText;
         public TMP_Text statusText;
-        public Vector3 targetLocalPosition;
-        public Vector3 targetLocalScale;
+        public Vector3 targetPosition;
+        public Vector3 targetLocalScale; // 🌟 真正隨距離變化的動態 Scale
         public float lastSeenTime;
     }
 
@@ -51,7 +55,6 @@ public class QRReader : MonoBehaviour
             Debug.LogError("❌ 找不到主相機！");
         }
 
-        // 初始化 ZXing 解碼器
         barcodeReader = new BarcodeReader
         {
             AutoRotate = true,
@@ -62,12 +65,17 @@ public class QRReader : MonoBehaviour
             }
         };
 
+        #if UNITY_EDITOR
+        if (webcamCanvas != null) webcamCanvas.SetActive(true);
+        #else
+        if (webcamCanvas != null) webcamCanvas.SetActive(false);
+        #endif
+
         StartCoroutine(ScanQRRoutine());
     }
 
     void Update()
     {
-        // ⚡ 在每幀平滑更新所有存在面板的位置與縮放
         List<string> keysToRemove = new List<string>();
 
         foreach (var kvp in activePanels)
@@ -75,55 +83,68 @@ public class QRReader : MonoBehaviour
             string qrKey = kvp.Key;
             ActivePanel panel = kvp.Value;
 
-            // 如果該 QR Code 消失超過指定時間，就準備將它刪除
             if (Time.time - panel.lastSeenTime > hideDelay)
             {
-                Destroy(panel.panelInstance);
+                if (panel.panelInstance != null) Destroy(panel.panelInstance);
                 keysToRemove.Add(qrKey);
                 continue;
             }
 
+            if (panel.panelInstance == null) continue;
+
+            if (!panel.panelInstance.activeSelf)
+            {
+                panel.panelInstance.SetActive(true);
+            }
+
             #if UNITY_EDITOR
-            // 💻 【電腦編輯器模擬環境測試】
             if (panel.panelInstance.transform.parent != mainCameraTransform)
             {
                 panel.panelInstance.transform.SetParent(mainCameraTransform, true);
             }
 
-            // 絲滑 Lerp 跟隨
             panel.panelInstance.transform.localPosition = Vector3.Lerp(
                 panel.panelInstance.transform.localPosition, 
-                panel.targetLocalPosition, 
+                panel.targetPosition, 
                 Time.deltaTime * 12f
             );
 
-            // 轉回正面
             panel.panelInstance.transform.localRotation = Quaternion.Euler(0f, 0f, 0f);
 
-            // 絲滑近大遠小縮放
             panel.panelInstance.transform.localScale = Vector3.Lerp(
                 panel.panelInstance.transform.localScale, 
                 panel.targetLocalScale, 
                 Time.deltaTime * 12f
             );
             #else
-            // 👓 【HoloLens 2 實機部署環境】
             if (panel.panelInstance.transform.parent != null)
             {
                 panel.panelInstance.transform.SetParent(null);
             }
 
+            // 平滑跟隨位置
             panel.panelInstance.transform.position = Vector3.Lerp(
                 panel.panelInstance.transform.position, 
-                panel.targetLocalPosition, 
+                panel.targetPosition, 
                 Time.deltaTime * 12f
             );
-            panel.panelInstance.transform.LookAt(mainCameraTransform.position);
-            panel.panelInstance.transform.Rotate(0, 180, 0);
+
+            // 面板始終朝向使用者眼睛
+            if (mainCameraTransform != null)
+            {
+                panel.panelInstance.transform.LookAt(mainCameraTransform.position);
+                panel.panelInstance.transform.Rotate(0, 180, 0);
+            }
+
+            // 🌟 關鍵修正：平滑跟隨「動態比例」，手機拿近時面板會即時放大！
+            panel.panelInstance.transform.localScale = Vector3.Lerp(
+                panel.panelInstance.transform.localScale, 
+                panel.targetLocalScale, 
+                Time.deltaTime * 12f
+            );
             #endif
         }
 
-        // 清除已經消失的面板資料
         foreach (var key in keysToRemove)
         {
             activePanels.Remove(key);
@@ -175,7 +196,6 @@ public class QRReader : MonoBehaviour
             {
                 try
                 {
-                    // 🌟 核心：改用 DecodeMultiple 同時辨識多個 QR Code！
                     results = barcodeReader.DecodeMultiple(c32, width, height);
                 }
                 catch { }
@@ -212,7 +232,7 @@ public class QRReader : MonoBehaviour
     {
         if (arPanelPrefab == null || points == null || points.Length == 0) return;
 
-        // 1. 計算 QR Code 的中心點
+        // 1. 計算 QR Code 中心點
         float sumX = 0, sumY = 0;
         foreach (var p in points)
         {
@@ -222,68 +242,97 @@ public class QRReader : MonoBehaviour
         float centerX = sumX / points.Length;
         float centerY = sumY / points.Length;
 
-        // 2. 計算目標位置與縮放
-        Vector3 calculatedLocalPos;
-        Vector3 calculatedLocalScale;
-
-        #if UNITY_EDITOR
-        // 💻 電腦模擬計算
-        float realWidth = camWidth;
-        float realHeight = camHeight;
-        if (cameraFeed != null && cameraFeed.cam != null)
-        {
-            realWidth = cameraFeed.cam.width;
-            realHeight = cameraFeed.cam.height;
-        }
-
-        float offsetX = (centerX / realWidth) - 0.5f;
-        float offsetY = (centerY / realHeight) - 0.5f;
-
-        calculatedLocalPos = new Vector3(offsetX * 0.6f, offsetY * 0.6f - 0.05f, 0.5f);
-
-        // 📐 動態縮放（近大遠小）
-        float qrWidthInPixels = 100f;
+        // 2. 計算 QR Code 在相機畫面中的「真實像素大小」
+        float qrSizeInPixels = 100f; 
         if (points.Length >= 2)
         {
-            qrWidthInPixels = Vector2.Distance(new Vector2(points[0].X, points[0].Y), new Vector2(points[1].X, points[1].Y));
+            float maxDist = 0f;
+            for (int i = 0; i < points.Length; i++)
+            {
+                for (int j = i + 1; j < points.Length; j++)
+                {
+                    float dist = Vector2.Distance(new Vector2(points[i].X, points[i].Y), new Vector2(points[j].X, points[j].Y));
+                    if (dist > maxDist) maxDist = dist;
+                }
+            }
+            qrSizeInPixels = maxDist / 1.414f; 
         }
-        float dynamicScaleFactor = Mathf.Clamp(qrWidthInPixels * 0.000008f, 0.0005f, 0.0018f);
-        calculatedLocalScale = new Vector3(dynamicScaleFactor, dynamicScaleFactor, dynamicScaleFactor);
-        #else
-        // 👓 HoloLens 2 實機計算
-        Vector3 normalizedScreenPos = new Vector3(centerX / camWidth, centerY / camHeight, 0f);
-        Vector3 viewPortPos = new Vector3(normalizedScreenPos.x, normalizedScreenPos.y, 1.0f);
-        Vector3 targetWorldPos = Camera.main.ViewportToWorldPoint(viewPortPos);
-        targetWorldPos += Vector3.up * 0.1f;
 
-        calculatedLocalPos = targetWorldPos;
-        calculatedLocalScale = new Vector3(0.001f, 0.001f, 0.001f); // 實機使用固定縮放
+        Vector3 calculatedPos;
+        Vector3 calculatedScale;
+
+        #if UNITY_EDITOR
+        float realWidth = cameraFeed.cam != null ? cameraFeed.cam.width : camWidth;
+        float realHeight = cameraFeed.cam != null ? cameraFeed.cam.height : camHeight;
+
+        float offsetX = (centerX / realWidth) - 0.5f;
+        float offsetY = 0.5f - (centerY / realHeight); 
+
+        if (mainCameraTransform != null)
+        {
+            calculatedPos = mainCameraTransform.position 
+                          + mainCameraTransform.forward * 0.5f 
+                          + mainCameraTransform.right * (offsetX * 0.4f) 
+                          + mainCameraTransform.up * (offsetY * 0.4f + 0.02f);
+        }
+        else
+        {
+            calculatedPos = new Vector3(offsetX, offsetY, 0.5f);
+        }
+
+        // Editor 動態 Scale
+        float editorDynamic = Mathf.Clamp(qrSizeInPixels * 0.00001f, 0.0005f, 0.002f);
+        calculatedScale = new Vector3(editorDynamic, editorDynamic, editorDynamic);
+
+        #else
+        // 👓 【HoloLens 2 實機真正的動態隨距離變化邏輯】
+        if (mainCameraTransform != null)
+        {
+            float normX = (centerX / (float)camWidth) - 0.5f;
+            float normY = 0.5f - (centerY / (float)camHeight); 
+
+            // 根據像素估算距離 (0.3m ~ 1.0m)
+            float distance = Mathf.Clamp(260f / qrSizeInPixels, 0.3f, 1.0f);
+
+            Vector3 centerWorldPos = mainCameraTransform.position 
+                                   + mainCameraTransform.forward * distance 
+                                   + mainCameraTransform.right * (normX * distance * 0.7f) 
+                                   + mainCameraTransform.up * (normY * distance * 0.7f);
+
+            // 位置始終貼在 QR Code 頭頂
+            calculatedPos = centerWorldPos + mainCameraTransform.up * 0.02f;
+        }
+        else
+        {
+            calculatedPos = Vector3.forward * 0.5f;
+        }
+
+        // 🌟 🌟 關鍵邏輯：Scale 徹底跟隨 qrSizeInPixels 動態計算！🌟 🌟
+        // 拿極遠(50px) -> Scale = 0.0003 (微型標籤)
+        // 拿極近(300px) -> Scale = 0.0018 (隨手機放大 6 倍，極度清晰且比例完美)
+        float dynamicScale = Mathf.Clamp(qrSizeInPixels * 0.000006f, 0.0003f, 0.002f);
+        calculatedScale = new Vector3(dynamicScale, dynamicScale, dynamicScale);
         #endif
 
-        // 3. 更新或創建面板實例
+        // 3. 更新或新建面板
         if (activePanels.TryGetValue(qrKey, out ActivePanel existingPanel))
         {
-            // 已存在面板：更新目標資料與看到的時間
-            existingPanel.targetLocalPosition = calculatedLocalPos;
-            existingPanel.targetLocalScale = calculatedLocalScale;
+            existingPanel.targetPosition = calculatedPos;
+            existingPanel.targetLocalScale = calculatedScale; // 🌟 實時傳遞最新的動態尺寸
             existingPanel.lastSeenTime = Time.time;
+            
             UpdateTextDisplay(existingPanel.titleText, existingPanel.statusText, seatId, status);
         }
         else
         {
-            // 🆕 建立新面板：實例化 Prefab
             GameObject newPanelObj = Instantiate(arPanelPrefab);
-            
-            // 🌟 【加在這一行！】強制把複製出來的面板勾勾打開
             newPanelObj.SetActive(true);
-            
-            // 尋找子物件中的 Title 和 Status 元件
+
             TMP_Text titleComponent = newPanelObj.transform.Find("Title")?.GetComponent<TMP_Text>();
             TMP_Text statusComponent = newPanelObj.transform.Find("Status")?.GetComponent<TMP_Text>();
 
             if (titleComponent == null || statusComponent == null)
             {
-                // 如果找不到，嘗試使用 GetComponentsInChildren 作為備案
                 TMP_Text[] tmps = newPanelObj.GetComponentsInChildren<TMP_Text>();
                 if (tmps.Length >= 2)
                 {
@@ -292,9 +341,16 @@ public class QRReader : MonoBehaviour
                 }
             }
 
-            // 初始化位置與縮放，避免生成時瞬移過大
-            newPanelObj.transform.localPosition = calculatedLocalPos;
-            newPanelObj.transform.localScale = calculatedLocalScale;
+            if (Application.isEditor)
+            {
+                newPanelObj.transform.localPosition = calculatedPos;
+            }
+            else
+            {
+                newPanelObj.transform.position = calculatedPos;
+            }
+            
+            newPanelObj.transform.localScale = calculatedScale;
 
             UpdateTextDisplay(titleComponent, statusComponent, seatId, status);
 
@@ -303,8 +359,8 @@ public class QRReader : MonoBehaviour
                 panelInstance = newPanelObj,
                 titleText = titleComponent,
                 statusText = statusComponent,
-                targetLocalPosition = calculatedLocalPos,
-                targetLocalScale = calculatedLocalScale,
+                targetPosition = calculatedPos,
+                targetLocalScale = calculatedScale,
                 lastSeenTime = Time.time
             };
 
