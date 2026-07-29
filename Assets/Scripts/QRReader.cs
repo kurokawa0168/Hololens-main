@@ -1,60 +1,77 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Threading;
 using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.Networking;
 using TMPro;
 using ZXing;
 
+// --- JSON 資料結構定義（對應 MongoDB 欄位）---
+[System.Serializable]
+public class UserData
+{
+    public string account;
+    public string name;
+    public string role;
+    public string U_id;
+    public string user_id;
+    public int seat_number;
+}
+
+[System.Serializable]
+public class UserApiResponse
+{
+    public bool success;
+    public string seatId;
+    public string status;
+    public UserData user;
+    public string message;
+}
+
 public class QRReader : MonoBehaviour
 {
-    private CameraFeed cameraFeed;
+    [Header("UI 畫面視覺元件")]
+    public RawImage rawImageBackground;
+    public AspectRatioFitter aspectRatioFitter;
+    public RectTransform scanZone;
+    public TextMeshProUGUI statusText;
+    public TextMeshProUGUI qrResultText;
+    public TextMeshProUGUI debugLogText;
+
+    [Header("網路 API 設定")]
+    [Tooltip("請輸入 API 基本 URL，例如 http://127.0.0.1:8080/api/users/")]
+    public string apiBaseUrl = "http://127.0.0.1:8080/api/users/";
+
+    [Header("掃描參數設定")]
+    public bool enableAutoScan = true;
+    public float scanInterval = 0.5f; // 解碼間隔秒數
+    public bool showDebugGUI = true;
+
+    // --- 攝影機控制變數 ---
+    private WebCamTexture webCamTexture;
+    private bool isCamAvailable = false;
+
+    // --- 多線程 (Threading) 異步解碼變數 ---
+    private Thread qrDecodeThread;
+    private Color32[] c32Data;
+    private int W, H;
+    private bool isDecoding = false;
+    private string decodedResultText = "";
+    private bool hasNewResult = false;
+
+    // --- ZXing 解碼器與連線鎖定 ---
     private IBarcodeReader barcodeReader;
-    private Transform mainCameraTransform;
-
-    [Header("UI Prefab Settings")]
-    [Tooltip("請把做好的 AR_Panel Prefab 拖到這裡")]
-    public GameObject arPanelPrefab;   
-
-    [Header("Environment Settings")]
-    [Tooltip("電腦測試用的 Webcam 背景 Canvas（HoloLens 上會自動關閉）")]
-    public GameObject webcamCanvas; 
-
-    [Header("Detection Settings")]
-    [Range(0.05f, 2f)]
-    public float scanInterval = 0.1f;  // 掃描頻率
-    private bool isScanning = false;
-
-    // 用於追蹤目前畫面上所有產生的 AR 面板
-    private class ActivePanel
-    {
-        public GameObject panelInstance;
-        public TMP_Text titleText;
-        public TMP_Text statusText;
-        public Vector3 targetPosition;
-        public Vector3 targetLocalScale; // 🌟 真正隨距離變化的動態 Scale
-        public float lastSeenTime;
-    }
-
-    private Dictionary<string, ActivePanel> activePanels = new Dictionary<string, ActivePanel>();
-    private const float hideDelay = 1.0f; // 超過 1 秒沒掃到該 QR 碼就自動刪除面板
+    private bool isProcessingApi = false;
+    private string lastScannedCode = "";
+    private float lastScanTime = 0f;
 
     void Start()
     {
-        cameraFeed = FindObjectOfType<CameraFeed>();
-        if (cameraFeed == null)
-        {
-            Debug.LogError("❌ 找不到 CameraFeed 腳本！");
-        }
+        LogToConsoleAndUI("🚀 初始化 QRReader 系統中...");
 
-        if (Camera.main != null)
-        {
-            mainCameraTransform = Camera.main.transform;
-        }
-        else
-        {
-            Debug.LogError("❌ 找不到主相機！");
-        }
-
+        // 1. 初始化 ZXing 核心設定
         barcodeReader = new BarcodeReader
         {
             AutoRotate = true,
@@ -65,326 +82,282 @@ public class QRReader : MonoBehaviour
             }
         };
 
-        #if UNITY_EDITOR
-        if (webcamCanvas != null) webcamCanvas.SetActive(true);
-        #else
-        if (webcamCanvas != null) webcamCanvas.SetActive(false);
-        #endif
+        // 2. 初始化鏡頭
+        InitializeWebCam();
 
-        StartCoroutine(ScanQRRoutine());
+        // 3. 啟動背景定期掃描 Coroutine
+        StartCoroutine(ScanLoop());
+    }
+
+    void InitializeWebCam()
+    {
+        WebCamDevice[] devices = WebCamTexture.devices;
+        if (devices.Length == 0)
+        {
+            LogToConsoleAndUI("⚠️ 未偵測到可用攝影機！可按 T / Y 鍵進行模擬測試。");
+            return;
+        }
+
+        for (int i = 0; i < devices.Length; i++)
+        {
+            if (!devices[i].isFrontFacing)
+            {
+                webCamTexture = new WebCamTexture(devices[i].name, 1280, 720);
+                break;
+            }
+        }
+
+        if (webCamTexture == null && devices.Length > 0)
+        {
+            webCamTexture = new WebCamTexture(devices[0].name, 1280, 720);
+        }
+
+        if (webCamTexture != null)
+        {
+            webCamTexture.Play();
+            if (rawImageBackground != null)
+            {
+                rawImageBackground.texture = webCamTexture;
+            }
+            isCamAvailable = true;
+            LogToConsoleAndUI("📷 攝影機啟動成功！");
+        }
     }
 
     void Update()
     {
-        List<string> keysToRemove = new List<string>();
-
-        foreach (var kvp in activePanels)
+        // =============================================================
+        // 🧪 測試按鍵邏輯：對應雲端 MongoDB 真實存在的帳號 (e001 / s001)
+        // =============================================================
+        if (Input.GetKeyDown(KeyCode.T))
         {
-            string qrKey = kvp.Key;
-            ActivePanel panel = kvp.Value;
-
-            if (Time.time - panel.lastSeenTime > hideDelay)
-            {
-                if (panel.panelInstance != null) Destroy(panel.panelInstance);
-                keysToRemove.Add(qrKey);
-                continue;
-            }
-
-            if (panel.panelInstance == null) continue;
-
-            if (!panel.panelInstance.activeSelf)
-            {
-                panel.panelInstance.SetActive(true);
-            }
-
-            #if UNITY_EDITOR
-            if (panel.panelInstance.transform.parent != mainCameraTransform)
-            {
-                panel.panelInstance.transform.SetParent(mainCameraTransform, true);
-            }
-
-            panel.panelInstance.transform.localPosition = Vector3.Lerp(
-                panel.panelInstance.transform.localPosition, 
-                panel.targetPosition, 
-                Time.deltaTime * 12f
-            );
-
-            panel.panelInstance.transform.localRotation = Quaternion.Euler(0f, 0f, 0f);
-
-            panel.panelInstance.transform.localScale = Vector3.Lerp(
-                panel.panelInstance.transform.localScale, 
-                panel.targetLocalScale, 
-                Time.deltaTime * 12f
-            );
-            #else
-            if (panel.panelInstance.transform.parent != null)
-            {
-                panel.panelInstance.transform.SetParent(null);
-            }
-
-            // 平滑跟隨位置
-            panel.panelInstance.transform.position = Vector3.Lerp(
-                panel.panelInstance.transform.position, 
-                panel.targetPosition, 
-                Time.deltaTime * 12f
-            );
-
-            // 面板始終朝向使用者眼睛
-            if (mainCameraTransform != null)
-            {
-                panel.panelInstance.transform.LookAt(mainCameraTransform.position);
-                panel.panelInstance.transform.Rotate(0, 180, 0);
-            }
-
-            // 🌟 關鍵修正：平滑跟隨「動態比例」，手機拿近時面板會即時放大！
-            panel.panelInstance.transform.localScale = Vector3.Lerp(
-                panel.panelInstance.transform.localScale, 
-                panel.targetLocalScale, 
-                Time.deltaTime * 12f
-            );
-            #endif
+            LogToConsoleAndUI("🧪 [測試模式] 按下 T 鍵 -> 模擬掃描教師帳號: e001");
+            OnQRCodeScanned("e001");
         }
 
-        foreach (var key in keysToRemove)
+        if (Input.GetKeyDown(KeyCode.Y))
         {
-            activePanels.Remove(key);
+            LogToConsoleAndUI("🧪 [測試模式] 按下 Y 鍵 -> 模擬掃描學生帳號: s001");
+            OnQRCodeScanned("s001");
+        }
+
+        if (Input.GetKeyDown(KeyCode.U))
+        {
+            LogToConsoleAndUI("🧪 [測試模式] 按下 U 鍵 -> 模擬掃描學生帳號: s002");
+            OnQRCodeScanned("s002");
+        }
+
+        if (Input.GetKeyDown(KeyCode.I))
+        {
+            LogToConsoleAndUI("🧪 [測試模式] 按下 I 鍵 -> 模擬掃描學生帳號: s003");
+            OnQRCodeScanned("s003");
+        }
+        // =============================================================
+
+        // 更新鏡頭顯示比例與轉向
+        if (isCamAvailable && webCamTexture != null && webCamTexture.isPlaying)
+        {
+            UpdateCameraAspectRatio();
+        }
+
+        // 檢查背景 Thread 是否已完成 QR Code 解碼
+        if (hasNewResult)
+        {
+            hasNewResult = false;
+            if (!string.IsNullOrEmpty(decodedResultText))
+            {
+                LogToConsoleAndUI($"🎯 鏡頭異步解碼成功: {decodedResultText}");
+                OnQRCodeScanned(decodedResultText);
+            }
         }
     }
 
-    IEnumerator ScanQRRoutine()
+    void UpdateCameraAspectRatio()
+    {
+        if (webCamTexture.width < 100) return;
+
+        float ratio = (float)webCamTexture.width / (float)webCamTexture.height;
+        if (aspectRatioFitter != null)
+        {
+            aspectRatioFitter.aspectRatio = ratio;
+        }
+
+        int orient = -webCamTexture.videoRotationAngle;
+        if (rawImageBackground != null)
+        {
+            rawImageBackground.rectTransform.localEulerAngles = new Vector3(0, 0, orient);
+        }
+    }
+
+    IEnumerator ScanLoop()
     {
         while (true)
         {
-            if (cameraFeed != null && cameraFeed.cam != null && cameraFeed.cam.isPlaying && !isScanning)
-            {
-                yield return StartCoroutine(DecodeQRFrame());
-            }
             yield return new WaitForSeconds(scanInterval);
+
+            if (enableAutoScan && isCamAvailable && webCamTexture != null && webCamTexture.isPlaying && !isDecoding && !isProcessingApi)
+            {
+                c32Data = webCamTexture.GetPixels32();
+                W = webCamTexture.width;
+                H = webCamTexture.height;
+
+                if (c32Data != null && c32Data.Length > 0)
+                {
+                    isDecoding = true;
+                    qrDecodeThread = new Thread(DecodeQRThread);
+                    qrDecodeThread.Start();
+                }
+            }
         }
     }
 
-    IEnumerator DecodeQRFrame()
+    void DecodeQRThread()
     {
-        isScanning = true;
-
-        WebCamTexture webCamTex = cameraFeed.cam;
-        int width = webCamTex.width;
-        int height = webCamTex.height;
-
-        if (width < 100 || height < 100)
-        {
-            isScanning = false;
-            yield break;
-        }
-
-        Color32[] c32 = null;
         try
         {
-            c32 = webCamTex.GetPixels32();
+            var result = barcodeReader.Decode(c32Data, W, H);
+            if (result != null)
+            {
+                decodedResultText = result.Text;
+                hasNewResult = true;
+            }
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("讀取 Webcam 像素失敗: " + ex.Message);
+            Debug.LogWarning("Thread 解碼異常: " + ex.Message);
         }
-
-        if (c32 != null)
+        finally
         {
-            Result[] results = null;
-            bool done = false;
-
-            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-            {
-                try
-                {
-                    results = barcodeReader.DecodeMultiple(c32, width, height);
-                }
-                catch { }
-                done = true;
-            });
-
-            while (!done) yield return null;
-
-            if (results != null && results.Length > 0)
-            {
-                foreach (var result in results)
-                {
-                    string rawText = result.Text;
-                    string[] parts = rawText.Split(',');
-
-                    string seatId = rawText;
-                    string status = "Unknown";
-
-                    if (parts.Length == 2)
-                    {
-                        seatId = parts[0].Trim();
-                        status = parts[1].Trim();
-                    }
-
-                    UpdateOrCreatePanel(rawText, seatId, status, result.ResultPoints, width, height);
-                }
-            }
-        }
-
-        isScanning = false;
-    }
-
-    private void UpdateOrCreatePanel(string qrKey, string seatId, string status, ResultPoint[] points, int camWidth, int camHeight)
-    {
-        if (arPanelPrefab == null || points == null || points.Length == 0) return;
-
-        // 1. 計算 QR Code 中心點
-        float sumX = 0, sumY = 0;
-        foreach (var p in points)
-        {
-            sumX += p.X;
-            sumY += p.Y;
-        }
-        float centerX = sumX / points.Length;
-        float centerY = sumY / points.Length;
-
-        // 2. 計算 QR Code 在相機畫面中的「真實像素大小」
-        float qrSizeInPixels = 100f; 
-        if (points.Length >= 2)
-        {
-            float maxDist = 0f;
-            for (int i = 0; i < points.Length; i++)
-            {
-                for (int j = i + 1; j < points.Length; j++)
-                {
-                    float dist = Vector2.Distance(new Vector2(points[i].X, points[i].Y), new Vector2(points[j].X, points[j].Y));
-                    if (dist > maxDist) maxDist = dist;
-                }
-            }
-            qrSizeInPixels = maxDist / 1.414f; 
-        }
-
-        Vector3 calculatedPos;
-        Vector3 calculatedScale;
-
-        #if UNITY_EDITOR
-        float realWidth = cameraFeed.cam != null ? cameraFeed.cam.width : camWidth;
-        float realHeight = cameraFeed.cam != null ? cameraFeed.cam.height : camHeight;
-
-        float offsetX = (centerX / realWidth) - 0.5f;
-        float offsetY = 0.5f - (centerY / realHeight); 
-
-        if (mainCameraTransform != null)
-        {
-            calculatedPos = mainCameraTransform.position 
-                          + mainCameraTransform.forward * 0.5f 
-                          + mainCameraTransform.right * (offsetX * 0.4f) 
-                          + mainCameraTransform.up * (offsetY * 0.4f + 0.02f);
-        }
-        else
-        {
-            calculatedPos = new Vector3(offsetX, offsetY, 0.5f);
-        }
-
-        // Editor 動態 Scale
-        float editorDynamic = Mathf.Clamp(qrSizeInPixels * 0.00001f, 0.0005f, 0.002f);
-        calculatedScale = new Vector3(editorDynamic, editorDynamic, editorDynamic);
-
-        #else
-        // 👓 【HoloLens 2 實機真正的動態隨距離變化邏輯】
-        if (mainCameraTransform != null)
-        {
-            float normX = (centerX / (float)camWidth) - 0.5f;
-            float normY = 0.5f - (centerY / (float)camHeight); 
-
-            // 根據像素估算距離 (0.3m ~ 1.0m)
-            float distance = Mathf.Clamp(260f / qrSizeInPixels, 0.3f, 1.0f);
-
-            Vector3 centerWorldPos = mainCameraTransform.position 
-                                   + mainCameraTransform.forward * distance 
-                                   + mainCameraTransform.right * (normX * distance * 0.7f) 
-                                   + mainCameraTransform.up * (normY * distance * 0.7f);
-
-            // 位置始終貼在 QR Code 頭頂
-            calculatedPos = centerWorldPos + mainCameraTransform.up * 0.02f;
-        }
-        else
-        {
-            calculatedPos = Vector3.forward * 0.5f;
-        }
-
-        // 🌟 🌟 關鍵邏輯：Scale 徹底跟隨 qrSizeInPixels 動態計算！🌟 🌟
-        // 拿極遠(50px) -> Scale = 0.0003 (微型標籤)
-        // 拿極近(300px) -> Scale = 0.0018 (隨手機放大 6 倍，極度清晰且比例完美)
-        float dynamicScale = Mathf.Clamp(qrSizeInPixels * 0.000006f, 0.0003f, 0.002f);
-        calculatedScale = new Vector3(dynamicScale, dynamicScale, dynamicScale);
-        #endif
-
-        // 3. 更新或新建面板
-        if (activePanels.TryGetValue(qrKey, out ActivePanel existingPanel))
-        {
-            existingPanel.targetPosition = calculatedPos;
-            existingPanel.targetLocalScale = calculatedScale; // 🌟 實時傳遞最新的動態尺寸
-            existingPanel.lastSeenTime = Time.time;
-            
-            UpdateTextDisplay(existingPanel.titleText, existingPanel.statusText, seatId, status);
-        }
-        else
-        {
-            GameObject newPanelObj = Instantiate(arPanelPrefab);
-            newPanelObj.SetActive(true);
-
-            TMP_Text titleComponent = newPanelObj.transform.Find("Title")?.GetComponent<TMP_Text>();
-            TMP_Text statusComponent = newPanelObj.transform.Find("Status")?.GetComponent<TMP_Text>();
-
-            if (titleComponent == null || statusComponent == null)
-            {
-                TMP_Text[] tmps = newPanelObj.GetComponentsInChildren<TMP_Text>();
-                if (tmps.Length >= 2)
-                {
-                    titleComponent = tmps[0];
-                    statusComponent = tmps[1];
-                }
-            }
-
-            if (Application.isEditor)
-            {
-                newPanelObj.transform.localPosition = calculatedPos;
-            }
-            else
-            {
-                newPanelObj.transform.position = calculatedPos;
-            }
-            
-            newPanelObj.transform.localScale = calculatedScale;
-
-            UpdateTextDisplay(titleComponent, statusComponent, seatId, status);
-
-            ActivePanel newPanel = new ActivePanel
-            {
-                panelInstance = newPanelObj,
-                titleText = titleComponent,
-                statusText = statusComponent,
-                targetPosition = calculatedPos,
-                targetLocalScale = calculatedScale,
-                lastSeenTime = Time.time
-            };
-
-            activePanels.Add(qrKey, newPanel);
+            isDecoding = false;
         }
     }
 
-    private void UpdateTextDisplay(TMP_Text titleTxt, TMP_Text statusTxt, string seatId, string status)
+    public void OnQRCodeScanned(string qrContent)
     {
-        if (titleTxt != null) titleTxt.text = "Seat: " + seatId;
-        if (statusTxt != null)
+        if (string.IsNullOrEmpty(qrContent)) return;
+
+        // 防重複發送連擊判斷 (3秒冷卻)
+        if (isProcessingApi || (qrContent == lastScannedCode && Time.time - lastScanTime < 3.0f))
+            return;
+
+        lastScannedCode = qrContent;
+        lastScanTime = Time.time;
+        isProcessingApi = true;
+
+        if (qrResultText != null) qrResultText.text = "掃描結果: " + qrContent;
+        LogToConsoleAndUI($"📡 正在發送 API 請求 -> {qrContent}");
+
+        string targetUrl = apiBaseUrl + qrContent.Trim();
+        StartCoroutine(FetchUserDataCoroutine(targetUrl));
+    }
+
+    IEnumerator FetchUserDataCoroutine(string url)
+    {
+        using (UnityWebRequest request = UnityWebRequest.Get(url))
         {
-            if (status == "Green" || status == "Available")
+            request.timeout = 5;
+            yield return request.SendWebRequest();
+
+            // 僅有在「網路物理斷線/伺服器未開啟」時認定為連線錯誤
+            if (request.result == UnityWebRequest.Result.ConnectionError)
             {
-                statusTxt.text = "<color=green>Status: Available</color>";
-            }
-            else if (status == "Red" || status == "Occupied")
-            {
-                statusTxt.text = "<color=red>Status: Occupied</color>";
+                LogToConsoleAndUI($"❌ 網路斷線錯誤: {request.error}");
+                if (statusText != null) statusText.text = "連線失敗: " + request.error;
             }
             else
             {
-                statusTxt.text = "<color=yellow>Status: " + status + "</color>";
+                // 允許讀取 HTTP 200 及 HTTP 404 (查無使用者) 的 JSON 內容
+                string jsonResult = request.downloadHandler.text;
+                LogToConsoleAndUI($"✅ 收到回應 (HTTP {request.responseCode}):\n{jsonResult}");
+
+                if (!string.IsNullOrEmpty(jsonResult))
+                {
+                    ProcessApiResponse(jsonResult);
+                }
             }
+        }
+
+        yield return new WaitForSeconds(1.5f);
+        isProcessingApi = false;
+    }
+
+    void ProcessApiResponse(string json)
+    {
+        try
+        {
+            UserApiResponse response = JsonUtility.FromJson<UserApiResponse>(json);
+
+            if (response != null && response.success)
+            {
+                // 組合完整可視化資訊
+                string displayInfo = $"【座位/帳號】: {response.seatId}\n" +
+                                     $"【使用狀態】: {(response.status == "Occupied" ? "🔴 使用中" : "🟢 空位")}";
+
+                if (response.user != null)
+                {
+                    displayInfo += $"\n【使用者姓名】: {response.user.name}\n" +
+                                   $"【帳號角色】: {response.user.role}\n" +
+                                   $"【帳號 ID】: {response.user.account}";
+                }
+
+                LogToConsoleAndUI($"🎉 資料讀取成功:\n{displayInfo}");
+
+                if (statusText != null)
+                {
+                    statusText.text = displayInfo;
+                }
+            }
+            else
+            {
+                string errorMsg = response != null ? response.message : "JSON 解析異常";
+                LogToConsoleAndUI($"⚠️ 後端回傳訊息: {errorMsg}");
+                if (statusText != null) statusText.text = errorMsg;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogToConsoleAndUI($"❌ JSON 解析例外: {ex.Message}");
+        }
+    }
+
+    void LogToConsoleAndUI(string message)
+    {
+        Debug.Log(message);
+        if (debugLogText != null)
+        {
+            debugLogText.text = $"[{DateTime.Now:HH:mm:ss}] {message}\n" + debugLogText.text;
+        }
+    }
+
+    void OnGUI()
+    {
+        if (!showDebugGUI) return;
+
+        GUI.Box(new Rect(10, 10, 220, 150), "QR Reader 測試面板");
+        if (GUI.Button(new Rect(20, 40, 200, 30), "測試 e001 (教師, 按 T)"))
+        {
+            OnQRCodeScanned("e001");
+        }
+        if (GUI.Button(new Rect(20, 80, 200, 30), "測試 s001 (學生, 按 Y)"))
+        {
+            OnQRCodeScanned("s001");
+        }
+        if (GUI.Button(new Rect(20, 120, 200, 20), "清空 Log"))
+        {
+            if (debugLogText != null) debugLogText.text = "";
+        }
+    }
+
+    void OnDestroy()
+    {
+        if (qrDecodeThread != null && qrDecodeThread.IsAlive)
+        {
+            qrDecodeThread.Abort();
+        }
+
+        if (webCamTexture != null && webCamTexture.isPlaying)
+        {
+            webCamTexture.Stop();
         }
     }
 }

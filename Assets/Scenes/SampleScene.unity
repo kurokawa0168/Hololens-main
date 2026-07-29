@@ -194,9 +194,16 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a7ab3fa6fbf80614a9b7ec30f57533bf, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  arPanelPrefab: {fileID: 6499093154115924199, guid: 71cf1e7b4441b5843a39c3641cf56fd6, type: 3}
-  webcamCanvas: {fileID: 1349164697}
+  rawImageBackground: {fileID: 0}
+  aspectRatioFitter: {fileID: 0}
+  scanZone: {fileID: 0}
+  statusText: {fileID: 0}
+  qrResultText: {fileID: 0}
+  debugLogText: {fileID: 0}
+  apiBaseUrl: http://127.0.0.1:8080/api/users/
+  enableAutoScan: 1
   scanInterval: 0.1
+  showDebugGUI: 1
 --- !u!1 &381219529
 GameObject:
   m_ObjectHideFlags: 0
